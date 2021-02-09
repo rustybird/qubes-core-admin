@@ -24,6 +24,7 @@
 
 import asyncio
 import collections
+import ctypes
 import errno
 import fcntl
 import functools
@@ -36,8 +37,10 @@ from contextlib import contextmanager, suppress
 
 import qubes.storage
 import qubes.utils
+import qubes.utils.ioctl
 
-FICLONE = 1074041865        # defined in <linux/fs.h>, assuming sizeof(int)==4
+FICLONE = qubes.utils.ioctl.MachineNumbers.iow(  # defined in <linux/fs.h>
+    0x94, 9, ctypes.sizeof(ctypes.c_int))
 LOOP_SET_CAPACITY = 0x4C07  # defined in <linux/loop.h>
 LOGGER = logging.getLogger('qubes.storage.reflink')
 
