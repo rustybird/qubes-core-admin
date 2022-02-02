@@ -56,10 +56,11 @@ def _coroutinized(function):
         function via the event loop's ThreadPool-based default
         executor.
     '''
+    @asyncio.coroutine
     @functools.wraps(function)
-    async def wrapper(*args, **kwargs):
-        return await asyncio.get_event_loop().run_in_executor(
-            None, functools.partial(function, *args, **kwargs))
+    def wrapper(*args, **kwargs):
+        return (yield from asyncio.get_event_loop().run_in_executor(
+            None, functools.partial(function, *args, **kwargs)))
     return wrapper
 
 
@@ -68,15 +69,14 @@ class ReflinkPool(qubes.storage.Pool):
     _known_dir_path_prefixes = ['appvms', 'vm-templates']
 
     def __init__(self, *, name, revisions_to_keep=1,
-                 dir_path, setup_check=True, ephemeral_volatile=False):
-        super().__init__(name=name, revisions_to_keep=revisions_to_keep,
-                         ephemeral_volatile=ephemeral_volatile)
+                 dir_path, setup_check=True):
+        super().__init__(name=name, revisions_to_keep=revisions_to_keep)
         self._setup_check = qubes.property.bool(None, None, setup_check)
         self._volumes = {}
         self.dir_path = os.path.abspath(dir_path)
 
     @_coroutinized
-    def setup(self):  # pylint: disable=invalid-overridden-method
+    def setup(self):
         created = _create_dir(self.dir_path)
         if self._setup_check and not is_supported(self.dir_path):
             if created:
@@ -111,7 +111,7 @@ class ReflinkPool(qubes.storage.Pool):
     def get_volume(self, vid):
         return self._volumes[vid]
 
-    async def destroy(self):
+    def destroy(self):
         pass
 
     @property
@@ -121,7 +121,6 @@ class ReflinkPool(qubes.storage.Pool):
             'dir_path': self.dir_path,
             'driver': ReflinkPool.driver,
             'revisions_to_keep': self.revisions_to_keep,
-            'ephemeral_volatile': self.ephemeral_volatile,
         }
 
     @property
@@ -174,7 +173,7 @@ class ReflinkVolume(qubes.storage.Volume):
 
     @qubes.storage.Volume.locked
     @_coroutinized
-    def create(self):  # pylint: disable=invalid-overridden-method
+    def create(self):
         self._remove_all_images()
         if self.save_on_stop and not self.snap_on_start:
             with self._update_precache():
@@ -182,7 +181,7 @@ class ReflinkVolume(qubes.storage.Volume):
         return self
 
     @_coroutinized
-    def verify(self):  # pylint: disable=invalid-overridden-method
+    def verify(self):
         if self.snap_on_start:
             img = self.source._path_clean  # pylint: disable=protected-access
         elif self.save_on_stop:
@@ -197,7 +196,7 @@ class ReflinkVolume(qubes.storage.Volume):
 
     @qubes.storage.Volume.locked
     @_coroutinized
-    def remove(self):  # pylint: disable=invalid-overridden-method
+    def remove(self):
         self.pool._volumes.pop(self, None)  # pylint: disable=protected-access
         self._remove_all_images()
         _remove_empty_dir(os.path.dirname(self._path_vid))
@@ -229,7 +228,7 @@ class ReflinkVolume(qubes.storage.Volume):
 
     @qubes.storage.Volume.locked
     @_coroutinized
-    def start(self):  # pylint: disable=invalid-overridden-method
+    def start(self):
         self._remove_incomplete_images()
         if not self.is_dirty():
             if self.snap_on_start:
@@ -244,12 +243,15 @@ class ReflinkVolume(qubes.storage.Volume):
                 except FileNotFoundError:
                     _copy_file(self._path_clean, self._path_dirty)
             else:
-                _create_sparse_file(self._path_dirty, self._size)
+                # Preferably use the size of a leftover image, in case
+                # the volume was previously resized - but then a crash
+                # prevented qubes.xml serialization of the new size.
+                _create_sparse_file(self._path_dirty, self.size)
         return self
 
     @qubes.storage.Volume.locked
     @_coroutinized
-    def stop(self):  # pylint: disable=invalid-overridden-method
+    def stop(self):
         if self.is_dirty():
             self._commit(self._path_dirty)
         elif not self.save_on_stop:
@@ -284,7 +286,7 @@ class ReflinkVolume(qubes.storage.Volume):
 
     @qubes.storage.Volume.locked
     @_coroutinized
-    def revert(self, revision=None):  # pylint: disable=invalid-overridden-method
+    def revert(self, revision=None):
         if self.is_dirty():
             raise qubes.storage.StoragePoolException(
                 'Cannot revert: {} is not cleanly stopped'.format(self.vid))
@@ -296,7 +298,7 @@ class ReflinkVolume(qubes.storage.Volume):
 
     @qubes.storage.Volume.locked
     @_coroutinized
-    def resize(self, size):  # pylint: disable=invalid-overridden-method
+    def resize(self, size):
         ''' Resize a read-write volume; notify any corresponding loop
             devices of the size change.
         '''
@@ -315,7 +317,7 @@ class ReflinkVolume(qubes.storage.Volume):
         self._size = size
         return self
 
-    async def export(self):
+    def export(self):
         if not self.save_on_stop:
             raise NotImplementedError(
                 'Cannot export: {} is not save_on_stop'.format(self.vid))
@@ -323,34 +325,30 @@ class ReflinkVolume(qubes.storage.Volume):
 
     @qubes.storage.Volume.locked
     @_coroutinized
-    def import_data(self, size):  # pylint: disable=invalid-overridden-method
+    def import_data(self):
         if not self.save_on_stop:
             raise NotImplementedError(
                 'Cannot import_data: {} is not save_on_stop'.format(self.vid))
-        _create_sparse_file(self._path_import, size)
+        _create_sparse_file(self._path_import, self.size)
         return self._path_import
 
-    @_coroutinized
-    def _import_data_end_unlocked(self, success):
+    def _import_data_end(self, success):
         (self._commit if success else _remove_file)(self._path_import)
         return self
 
-    import_data_end = qubes.storage.Volume.locked(_import_data_end_unlocked)
+    import_data_end = qubes.storage.Volume.locked(_coroutinized(
+        _import_data_end))
 
     @qubes.storage.Volume.locked
-    async def import_volume(self, src_volume):
+    @_coroutinized
+    def import_volume(self, src_volume):
         if self.save_on_stop:
             try:
                 success = False
-                src_path = await qubes.utils.coro_maybe(src_volume.export())
-                try:
-                    await _coroutinized(_copy_file)(src_path, self._path_import)
-                finally:
-                    await qubes.utils.coro_maybe(
-                        src_volume.export_end(src_path))
+                _copy_file(src_volume.export(), self._path_import)
                 success = True
             finally:
-                await self._import_data_end_unlocked(success)
+                self._import_data_end(success)
         return self
 
     def _path_revision(self, revision=None, timestamp=None):
