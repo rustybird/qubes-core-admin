@@ -31,6 +31,7 @@ import glob
 import logging
 import os
 import platform
+import stat
 import subprocess
 import tempfile
 from contextlib import contextmanager, suppress
@@ -408,17 +409,23 @@ def _hardlink_file(src, dst):
     LOGGER.info('Hardlinked file: %r -> %r', src, dst)
 
 def _create_dir(path):
+    parent, leaf = os.path.split(path)
+    parent_fd = os.open(parent, os.O_RDONLY)
+
     try:
-        created = False
-        os.mkdir(path)
-        created = True
-    except FileExistsError:
-        if not os.path.isdir(path):
-            raise
-    if created:
-        qubes.utils.fsync_path(os.path.dirname(path))
-        LOGGER.info('Created directory: %r', path)
-    return created
+        try:
+            created = False
+            os.mkdir(leaf, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            if not stat.S_ISDIR(os.stat(leaf, dir_fd=parent_fd).st_mode):
+                raise
+        if created:
+            os.fsync(parent_fd)
+            LOGGER.info('Created directory: %r', path)
+        return created
+    finally:
+        os.close(parent_fd)
 
 def _remove_empty_dir(path):
     try:
